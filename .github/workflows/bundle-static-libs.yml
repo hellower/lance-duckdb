@@ -1,0 +1,220 @@
+#
+# Fork-specific release infrastructure (hellower/lance-duckdb).
+#
+# Builds DuckDB static-libs bundles with the lance extension statically
+# linked, mirroring DuckDB's official BundleStaticLibs.yml recipe
+# (duckdb/.github/workflows/BundleStaticLibs.yml) with the lance
+# extension_config.cmake appended to EXTENSION_CONFIGS. The linux leg
+# builds inside the same manylinux_2_28 container as upstream so the
+# archives stay linkable on older-glibc consumers.
+#
+# The bundle layout matches the official duckdb static-libs zips
+# (flat: duckdb.h + all lib*.a) plus:
+#   - liblance_extension.a      (C++ extension archive, via gather-libs)
+#   - liblance_duckdb_ffi.a     (Rust core staticlib, cargo build product)
+#
+# Artifacts: duckdb-static-libs-with-lance-<platform>.zip (+ .sha256)
+#   platform: linux_amd64 | darwin_arm64
+#
+# On tag push (bundle-v*) a separate release job — gated on ALL matrix
+# builds succeeding — attaches the zips to a GitHub Release, so embedding
+# consumers can download and sha256-verify them.
+#
+# Release tag convention: bundle-v<extension version>.<bundle patch>,
+# e.g. bundle-v0.5.4.1 = lance-duckdb extension v0.5.4, fork bundle
+# patch 1.
+#
+name: Bundle Static Libs
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'bundle-v*'
+
+permissions:
+  contents: read
+
+env:
+  DUCKDB_TAG: v1.5.4
+  PROTOC_VERSION: '29.3'
+
+jobs:
+  build:
+    name: Bundle (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `platform` names our artifacts/assets (goosedb platform
+          # convention). The DUCKDB_PLATFORM build parameter keeps
+          # DuckDB's own platform IDs (linux_amd64 / osx_arm64).
+          - platform: linux_amd64
+            runner: ubuntu-24.04
+          - platform: darwin_arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Pin the DuckDB submodule to the release tag at build time only.
+      # The tracked submodule pointer in this repo is left untouched.
+      - name: Checkout DuckDB submodule at ${{ env.DUCKDB_TAG }}
+        run: |
+          git -C duckdb fetch --depth 1 origin tag "${DUCKDB_TAG}"
+          git -C duckdb checkout "${DUCKDB_TAG}"
+          git -C duckdb log -1 --oneline
+
+      # ---------------------------------------------------------------
+      # Linux: build inside DuckDB's manylinux_2_28 container (the same
+      # image upstream BundleStaticLibs.yml uses) so the archives are
+      # linkable on older-glibc systems. Rust, protoc, ninja and ccache
+      # are installed inside the container.
+      # ---------------------------------------------------------------
+      - name: Restore ccache (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-bundle-linux_amd64-${{ github.run_id }}
+          restore-keys: |
+            ccache-bundle-linux_amd64-
+
+      - name: Build in manylinux container (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          docker run \
+            -v"$PWD":"$PWD" \
+            -e CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)" \
+            -e OVERRIDE_GIT_DESCRIBE="${DUCKDB_TAG}" \
+            -e EXTENSION_CONFIGS="$PWD/duckdb/.github/config/bundled_extensions.cmake;$PWD/extension_config.cmake" \
+            -e ENABLE_EXTENSION_AUTOLOADING=1 \
+            -e ENABLE_EXTENSION_AUTOINSTALL=1 \
+            -e GEN=ninja \
+            -e DUCKDB_PLATFORM=linux_amd64 \
+            -e CCACHE_DIR="$PWD/.ccache" \
+            -e PROTOC_VERSION="${PROTOC_VERSION}" \
+            quay.io/pypa/manylinux_2_28_x86_64 \
+            bash -c "
+              set -e
+              dnf install -y epel-release
+              dnf install -y perl-IPC-Cmd gcc-toolset-12 gcc-toolset-12-gcc-c++ ccache ninja-build unzip
+
+              source /opt/rh/gcc-toolset-12/enable
+              export CC=gcc
+              export CXX=g++
+
+              # protoc for prost-build (the EL8 distro protobuf is too old)
+              curl -fsSL -o /tmp/protoc.zip \
+                https://github.com/protocolbuffers/protobuf/releases/download/v\${PROTOC_VERSION}/protoc-\${PROTOC_VERSION}-linux-x86_64.zip
+              unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+
+              # Rust toolchain (rust-toolchain.toml at the repo root selects stable)
+              curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+              source \$HOME/.cargo/env
+
+              git config --global --add safe.directory '*'
+              make gather-libs -C $PWD/duckdb
+              ccache -s || true
+            "
+
+      # ---------------------------------------------------------------
+      # macOS: build natively on the arm64 runner.
+      # ---------------------------------------------------------------
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja protobuf
+
+      - name: Setup ccache (macOS)
+        if: runner.os == 'macOS'
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: bundle-${{ matrix.platform }}
+          max-size: 2G
+
+      # rust-toolchain.toml at the repo root selects the toolchain;
+      # this pre-installs it so the cmake-driven cargo build does not
+      # pay the download cost mid-build.
+      - name: Install Rust toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        env:
+          EXTENSION_CONFIGS: ${{ github.workspace }}/duckdb/.github/config/bundled_extensions.cmake;${{ github.workspace }}/extension_config.cmake
+          ENABLE_EXTENSION_AUTOLOADING: 1
+          ENABLE_EXTENSION_AUTOINSTALL: 1
+          GEN: ninja
+          DUCKDB_PLATFORM: osx_arm64
+          OSX_BUILD_ARCH: arm64
+          OVERRIDE_GIT_DESCRIBE: ${{ env.DUCKDB_TAG }}
+        run: make -C duckdb gather-libs
+
+      # ---------------------------------------------------------------
+      # Common: assemble and checksum the bundle. Reads the build tree
+      # only (it may be root-owned on Linux after the docker build).
+      # ---------------------------------------------------------------
+      - name: Assemble bundle
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euxo pipefail
+          LIBS=duckdb/build/release/libs
+
+          # The Rust core staticlib is a cargo build product and is not
+          # covered by gather-libs; bundle it explicitly.
+          RUST_LIB=$(find duckdb/build/release/cargo -type f -name 'liblance_duckdb_ffi.a' -path '*/release/*' | head -n1)
+          test -n "${RUST_LIB}"
+
+          # Sanity: the lance extension archive must be present.
+          test -f "${LIBS}/liblance_extension.a"
+          test -f "${LIBS}/libduckdb_static.a"
+          ls -la "${LIBS}/"
+
+          ZIP="duckdb-static-libs-with-lance-${PLATFORM}.zip"
+          zip -r -j "${ZIP}" "${LIBS}/" "${RUST_LIB}" duckdb/src/include/duckdb.h
+          shasum -a 256 "${ZIP}" > "${ZIP}.sha256"
+          cat "${ZIP}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-static-libs-with-lance-${{ matrix.platform }}
+          path: |
+            duckdb-static-libs-with-lance-${{ matrix.platform }}.zip
+            duckdb-static-libs-with-lance-${{ matrix.platform }}.zip.sha256
+          if-no-files-found: error
+
+  # Publish the release only after ALL matrix builds have succeeded,
+  # so a partial (single-platform) release is never exposed.
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/bundle-v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: duckdb-static-libs-with-lance-*
+          merge-multiple: true
+
+      - name: Attach bundles to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            duckdb-static-libs-with-lance-*.zip
+            duckdb-static-libs-with-lance-*.zip.sha256
+          body: >
+            DuckDB ${{ env.DUCKDB_TAG }} static-libs bundles with the lance
+            extension statically linked. Each zip contains the official
+            static-libs layout (duckdb.h + lib*.a) plus liblance_extension.a
+            and liblance_duckdb_ffi.a. Verify with:
+            `shasum -a 256 -c <zip>.sha256`.
