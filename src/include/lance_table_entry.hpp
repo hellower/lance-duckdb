@@ -53,6 +53,14 @@ public:
   TableFunction GetScanFunction(ClientContext &context,
                                 unique_ptr<FunctionData> &bind_data) override;
 
+  // Entry-side virtual columns (rowid / "" / _rowid) — same map as the scan
+  // function's get_virtual_columns hook. The binder falls back to this when
+  // the scan-function hook is not visible at bind time (observed on ATTACH
+  // catalog tables in embedded/static-link integrations); without the
+  // override the base implementation exposes only duckdb's default `rowid`,
+  // so `_rowid` fails to bind on catalog tables while bare-path scans work.
+  virtual_column_map_t GetVirtualColumns() const override;
+
   // Validate that this entry's declared schema state (columns, coerced
   // columns, NOT NULL constraints) still matches the dataset on storage.
   // Statements that bind a scan get this implicitly via GetScanFunction;

@@ -355,8 +355,11 @@ static bool LanceDeferredMaterializationEnabled(ClientContext &context) {
   return true; // default on
 }
 
-static virtual_column_map_t LanceGetVirtualColumns(ClientContext &,
-                                                   optional_ptr<FunctionData>) {
+// Shared builder for the virtual columns every lance scan exposes. Used by
+// both the scan-function hook (LanceGetVirtualColumns) and the catalog-entry
+// override (LanceTableEntry::GetVirtualColumns) so the two bind surfaces can
+// never drift apart.
+static virtual_column_map_t LanceVirtualColumnMap() {
   virtual_column_map_t result;
   result.emplace(COLUMN_IDENTIFIER_ROW_ID,
                  TableColumn("rowid", LogicalType::ROW_TYPE));
@@ -365,6 +368,23 @@ static virtual_column_map_t LanceGetVirtualColumns(ClientContext &,
   result.emplace(LANCE_COLUMN_IDENTIFIER_ROW_ID,
                  TableColumn(LANCE_ROW_ID_COLUMN_NAME, LogicalType::UBIGINT));
   return result;
+}
+
+static virtual_column_map_t LanceGetVirtualColumns(ClientContext &,
+                                                   optional_ptr<FunctionData>) {
+  return LanceVirtualColumnMap();
+}
+
+// Catalog-side fallback. The binder consults
+// TableCatalogEntry::GetVirtualColumns() whenever the scan function's
+// get_virtual_columns hook is not visible at bind time. This was observed in
+// embedded/static-link integrations: catalog-table binds fell back to the base
+// implementation (which only exposes duckdb's default `rowid`), so `_rowid`
+// failed to bind on ATTACH catalog tables while bare-path scans worked.
+// Overriding the entry-side hook with the same map keeps both bind paths
+// identical regardless of which hook the binder ends up using.
+virtual_column_map_t LanceTableEntry::GetVirtualColumns() const {
+  return LanceVirtualColumnMap();
 }
 
 static bool TryLanceExplainDatasetScan(void *dataset,

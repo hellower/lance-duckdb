@@ -1,0 +1,53 @@
+# name: test/sql/catalog_scan_virtual_rowid.test
+# description: ATTACH catalog tables expose the `_rowid` virtual column exactly
+#              like bare-path scans do: explicitly selectable, usable in WHERE
+#              (take pushdown), and structurally hidden from SELECT *.
+#              Regression guard for the catalog bind falling back to the base
+#              TableCatalogEntry virtual columns (only duckdb's default `rowid`)
+#              when the scan-function get_virtual_columns hook is not visible at
+#              bind time — LanceTableEntry now overrides GetVirtualColumns() so
+#              both bind paths serve the same map.
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '__TEST_DIR__' AS pc (TYPE LANCE);
+
+statement ok
+CREATE TABLE pc.t AS SELECT range::BIGINT AS id FROM range(5);
+
+# `_rowid` binds on the catalog table (native create => stable contiguous ids).
+query II
+SELECT id, _rowid FROM pc.t ORDER BY id;
+----
+0	0
+1	1
+2	2
+3	3
+4	4
+
+# duckdb's default `rowid` virtual column still binds alongside `_rowid`.
+query I
+SELECT count(*) FROM pc.t WHERE rowid >= 0;
+----
+5
+
+# `_rowid` is usable as a filter on the catalog table (take-pushdown path).
+query I
+SELECT id FROM pc.t WHERE _rowid IN (1, 3) ORDER BY id;
+----
+1
+3
+
+# Virtual columns never leak into SELECT * — exactly the one declared column.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM pc.t);
+----
+1
+
+# Bare-path and catalog observations agree on the same dataset.
+query I
+SELECT count(*) FROM pc.t c JOIN '__TEST_DIR__/t.lance' b ON c._rowid = b._rowid;
+----
+5
