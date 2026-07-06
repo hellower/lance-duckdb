@@ -1,0 +1,55 @@
+# name: test/sql/scan_rowid_stable_native_create.test
+# description: Native table creation enables stable (move-stable) row ids, so
+#              `_rowid` is a small monotonic id (never a fragment-encoded address)
+#              and is preserved verbatim across compaction. Regression guard for
+#              the FFI writer setting enable_stable_row_ids on WriteMode::Create
+#              and WriteMode::Overwrite — every DuckDB-native create path
+#              (empty CREATE TABLE, CREATE TABLE AS SELECT, COPY ... mode
+#              'overwrite') converges on that single WriteParams construction.
+# group: [sql]
+
+require lance
+
+# Create the dataset natively (WriteMode::Overwrite) — first fragment.
+statement ok
+COPY (SELECT * FROM (VALUES (0::BIGINT, 'a'::VARCHAR), (1, 'b'), (2, 'c')) t(id, name))
+TO '__TEST_DIR__/rowid_stable_native.lance' (FORMAT lance, mode 'overwrite');
+
+# Append a second fragment (WriteMode::Append honors the manifest's stable flag).
+statement ok
+COPY (SELECT * FROM (VALUES (3::BIGINT, 'd'::VARCHAR), (4, 'e'), (5, 'f')) t(id, name))
+TO '__TEST_DIR__/rowid_stable_native.lance' (FORMAT lance, mode 'append');
+
+# Decisive: with stable row ids every `_rowid` is a small contiguous id. Without
+# the fix the second fragment's rows carry fragment-encoded addresses
+# (fragment_id << 32 == 4294967296+), so this count must be 0.
+query I
+SELECT count(*) FROM '__TEST_DIR__/rowid_stable_native.lance' WHERE _rowid >= 4294967296
+----
+0
+
+# Snapshot the id -> _rowid mapping before compaction.
+statement ok
+CREATE TEMP TABLE rowid_before AS
+SELECT id, _rowid AS rid FROM '__TEST_DIR__/rowid_stable_native.lance';
+
+# Compact the two fragments into one.
+statement ok
+OPTIMIZE '__TEST_DIR__/rowid_stable_native.lance';
+
+# Stable row ids are preserved verbatim across compaction: no surviving row's
+# `_rowid` changed. Without the fix compaction reassigns row addresses, so this
+# count would be non-zero. Value-independent — proves preservation without
+# hardcoding the exact ids.
+query I
+SELECT count(*) FROM '__TEST_DIR__/rowid_stable_native.lance' d
+JOIN rowid_before b USING (id)
+WHERE d._rowid != b.rid
+----
+0
+
+# Sanity: all six rows survive the compaction.
+query I
+SELECT count(*) FROM '__TEST_DIR__/rowid_stable_native.lance'
+----
+6

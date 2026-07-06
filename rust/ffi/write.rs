@@ -891,6 +891,15 @@ fn open_writer_inner(
         data_storage_version,
         session,
         store_params: Some(store_params),
+        // Enable Lance stable (move-stable) row ids when this write materializes a
+        // new dataset manifest — Create (fresh table) and Overwrite (CREATE OR
+        // REPLACE). Every DuckDB-native table creation path converges here (empty
+        // CREATE TABLE, CREATE TABLE AS SELECT, schema-mismatch rewrite), so this
+        // makes every natively created Lance dataset carry the stable `_rowid`
+        // manifest property and keep row ids stable across compaction. Append is
+        // left at the default: Lance forces an append to honor the existing
+        // manifest's stable-row-id setting, so the flag only matters on first write.
+        enable_stable_row_ids: matches!(write_mode, WriteMode::Create | WriteMode::Overwrite),
         ..Default::default()
     };
 
